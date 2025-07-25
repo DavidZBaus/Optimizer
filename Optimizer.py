@@ -298,7 +298,10 @@ class PortfolioOptimizer():
             self.pct_spreads.value = ((index_prices + 0.5 * spreads) / index_prices - 1)
 
         # Run Optimizer
-        opt_val = self.problem.solve(solver="ECOS", warm_start=True)
+        try:
+            opt_val = self.problem.solve(solver="ECOS", warm_start=True)
+        except:
+            opt_val = self.problem.solve(solver="SCS", warm_start=True)
 
 
         if self.problem.status == "optimal" or self.problem.status == "optimal_inaccurate":
