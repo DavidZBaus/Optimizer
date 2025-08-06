@@ -28,7 +28,7 @@ class PortfolioOptimizer():
         volume_max_turnover: float, 
         lambda_0: float,
         alpha: float,  
-        sparsity_penalty: float,
+        min_portfolio_change: float,
         min_yearly_return: float, 
         taker_fee: float, 
         use_slippage: bool, 
@@ -50,8 +50,8 @@ class PortfolioOptimizer():
             Base Variance Penalty.
         alpha: float
             Growth of Variance Penalty as model error increases
-        sparsity_penalty: float
-            Sparsity Penalty parameter in objective
+        min_portfolio_change: float
+            Minimum change in portfolio before we update it (reduces turnover significantly)
         min_yearly_return: float
             Minimum yearly return
         taker_fee: float
@@ -68,7 +68,7 @@ class PortfolioOptimizer():
         self.volume_max_turnover = volume_max_turnover
         self.lambda_0 = lambda_0 # Base Variance Penalty
         self.alpha = alpha # Variance Penalty Growth
-        self.sparsity_penalty = sparsity_penalty
+        self.min_portfolio_change = min_portfolio_change # Minimum change in portfolio before we update it (reduces turnover significantly)
         self.min_yearly_return = min_yearly_return # Minimum yearly return
         self.taker_fee = taker_fee # Taker fee
         self.use_slippage = use_slippage # True if you want to incorporate slippage in the backtester
@@ -89,7 +89,7 @@ class PortfolioOptimizer():
         """
 
         # Minimum yearly return to trading period length transformation
-        self.min_period_return = (1 + self.min_yearly_return)**(self.forecast_length/HOURS_PER_YEAR) - 1
+        self.min_period_return = (1 + self.min_yearly_return)
 
         # Decision Variables
         self.weight = cvx.Variable(len(cur_tickers), name="weight") # Weight that gets optimized
@@ -115,7 +115,6 @@ class PortfolioOptimizer():
         # Variables and Parameters used in use_slippage mode
         if self.use_slippage:
             # Parameters corresponding to metrics and measurements
-            self.spreads = cvx.Parameter(len(cur_tickers), nonneg=True, name="spreads")
             self.index_prices = cvx.Parameter(len(cur_tickers), nonneg=True, name="index_prices")
 
             # Parameters used for DPP compliance
@@ -157,7 +156,7 @@ class PortfolioOptimizer():
         total_variance = cvx.sum_squares(z)
 
         # Optimization Problem Objective
-        obj = cvx.Maximize(return_after_costs - self.risk_aversion * total_variance_variable - self.sparsity_penalty * cvx.norm(self.weight, 1)) 
+        obj = cvx.Maximize(return_after_costs - self.risk_aversion * total_variance_variable) 
 
         # User Settings Optimization Problem Constraints
         constr = []
@@ -183,7 +182,7 @@ class PortfolioOptimizer():
         volume_max_turnover: float | None = None, 
         lambda_0: float | None = None, 
         alpha: float | None = None,
-        sparsity_penalty: float | None = None,
+        min_portfolio_change: float | None = None,
         min_yearly_return: float | None = None, 
         taker_fee: float | None = None
     ) -> None: 
@@ -202,8 +201,8 @@ class PortfolioOptimizer():
             Base Variance Penalty.
         alpha: float, optional
             Growth of Variance Penalty as Dawdown increases
-        sparsity_penalty: float
-            Sparsity Penalty parameter in objective
+        min_portfolio_change: float
+            Minimum change in portfolio before we update it (reduces turnover significantly)
         min_yearly_return: float, optional
             Minimum yearly return
         taker_fee: float, optional
@@ -218,8 +217,8 @@ class PortfolioOptimizer():
             self.lambda_0 = lambda_0 
         if alpha is not None:
             self.alpha = alpha 
-        if sparsity_penalty is not None:
-            self.sparsity_penalty = sparsity_penalty 
+        if min_portfolio_change is not None:
+            self.min_portfolio_change = min_portfolio_change
         if min_yearly_return is not None:
             self.min_yearly_return = min_yearly_return 
         if taker_fee is not None:
@@ -291,7 +290,6 @@ class PortfolioOptimizer():
         # Update Variables and Parameters used in use_slippage mode
         if self.use_slippage:
             # Update Parameters corresponding to metrics and measurements
-            self.spreads.value = spreads
             self.index_prices.value = index_prices
 
             # Update Parameters used for DPP compliance
@@ -428,6 +426,8 @@ class PortfolioOptimizer():
         # variance penalties tracker for plotting
         lambdas = []
 
+        min_yearly_return_cached = self.min_yearly_return
+
         for i in range(len(indexes)-1):
             old_holdings = cur_holdings.copy()
             cur_index = indexes[i]
@@ -559,9 +559,13 @@ class PortfolioOptimizer():
             portfolio_holdings = ((portfolio_holdings * equity[-1]) / cur_index_prices_full).fillna(0)
 
             # Change in Portfolio Holdings
-            cur_holdings = portfolio_holdings
-            holdings_change = cur_holdings - old_holdings
-            holdings_change_pct = (holdings_change * cur_index_prices_full)/equity[-1]
+            holdings_change = (portfolio_holdings - old_holdings).fillna(0)
+            holdings_change_pct = (holdings_change * cur_index_prices_full).fillna(0)/equity[-1]
+            if sum(abs(holdings_change_pct)) >= self.min_portfolio_change:
+                cur_holdings = portfolio_holdings
+
+            holdings_change = (cur_holdings - old_holdings).fillna(0)
+            holdings_change_pct = (holdings_change * cur_index_prices_full).fillna(0)/equity[-1]
 
             # Price change
             index_price_changes = (next_index_prices_full - cur_index_prices_full).fillna(0)
@@ -576,7 +580,7 @@ class PortfolioOptimizer():
             cur_slippage_fee = 0
             if self.use_slippage:
                 pct_spreads = ((cur_index_prices_full + 0.5 * cur_liquidity_full["spread"]) / cur_index_prices_full - 1).fillna(0)
-                cur_slippage_fees = (pct_spreads * abs(holdings_change)).fillna(0)
+                cur_slippage_fees = (pct_spreads * abs(holdings_change) * cur_index_prices_full).fillna(0)
                 cur_slippage_fee = sum(cur_slippage_fees)
             
             return_after_costs = cur_return - cur_taker_fee + cur_funding_fee - cur_slippage_fee
@@ -594,28 +598,24 @@ class PortfolioOptimizer():
             statistics_df = pd.concat([statistics_df, cur_aggregated_data])
 
             # Individual Coin Statistics
-            cur_ticker_gross_notionals = []
-            cur_ticker_eot_notionals = []
-            cur_ticker_holding_pnls = []
-            cur_ticker_taker_fees = []
-            cur_ticker_slippage_fees = []
-            cur_ticker_funding_pnls = []
-            cur_ticker_net_turnovers = []
-            cur_ticker_gross_turnovers = []
-            cur_ticker_net_pnls = []
-            for coin in cur_tickers:
-                cur_ticker_gross_notionals.append(abs(cur_holdings.loc[coin]) * cur_index_prices[coin])
-                cur_ticker_eot_notionals.append(cur_holdings.loc[coin] * cur_index_prices[coin])
-                cur_ticker_holding_pnls.append((cur_holdings.loc[coin] * index_price_changes.loc[coin]))
-                cur_ticker_taker_fees.append(-abs(holdings_change.loc[coin]) * self.taker_fee)
-                if self.use_slippage:
-                    cur_ticker_slippage_fees.append(-cur_slippage_fees[coin])
-                else:
-                    cur_ticker_slippage_fees.append(0)
-                cur_ticker_funding_pnls.append(-cur_funding_rates[coin] * cur_holdings[coin])
-                cur_ticker_net_turnovers.append(holdings_change_pct.loc[coin])
-                cur_ticker_gross_turnovers.append(abs(holdings_change_pct.loc[coin]))
-                cur_ticker_net_pnls.append(cur_ticker_holding_pnls[-1] + cur_ticker_taker_fees[-1] + cur_ticker_funding_pnls[-1] + cur_ticker_slippage_fees[-1])
+            holdings_values = cur_holdings.loc[cur_tickers].values  # All holdings at once (vectorized access)
+            prices_values = cur_index_prices.loc[cur_tickers].values  # Precompute index prices
+            index_price_changes_values = index_price_changes.loc[cur_tickers].values  # Precompute index price changes
+            slippage_fees_values = np.array([cur_slippage_fees.get(coin, 0) for coin in cur_tickers])  # Handle slippage fees
+            funding_rates_values = np.array([cur_funding_rates[coin] for coin in cur_tickers])  # Funding rates
+
+            # Preallocate arrays for results
+            cur_ticker_gross_notionals = np.abs(holdings_values) * prices_values
+            cur_ticker_eot_notionals = holdings_values * prices_values
+            cur_ticker_holding_pnls = holdings_values * index_price_changes_values
+            cur_ticker_taker_fees = -np.abs(holdings_change.loc[cur_tickers]) * self.taker_fee
+            cur_ticker_slippage_fees = -slippage_fees_values if self.use_slippage else np.zeros_like(slippage_fees_values)
+            cur_ticker_funding_pnls = -funding_rates_values * holdings_values
+            cur_ticker_net_turnovers = holdings_change_pct.loc[cur_tickers].values
+            cur_ticker_gross_turnovers = np.abs(holdings_change_pct.loc[cur_tickers].values)
+
+            # Compute net PnLs
+            cur_ticker_net_pnls = cur_ticker_holding_pnls + cur_ticker_taker_fees + cur_ticker_funding_pnls + cur_ticker_slippage_fees
 
             new_data = pd.DataFrame({"Gross Notional": cur_ticker_gross_notionals, "EOT Notional": cur_ticker_eot_notionals, "Holding PnL": cur_ticker_holding_pnls,
                                     "Taker Fees": cur_ticker_taker_fees, "Slippage Fees": cur_ticker_slippage_fees, "Funding PnL": cur_ticker_funding_pnls,
