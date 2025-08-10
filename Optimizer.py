@@ -8,6 +8,8 @@ from scipy.linalg import cholesky
 import sys
 import os
 
+from functools import reduce
+
 # Absolute or relative path to your library
 lib_path = os.path.abspath("/home/ubuntu/git/Baus-Research/")
 
@@ -31,7 +33,6 @@ class PortfolioOptimizer():
         min_portfolio_change: float,
         min_yearly_return: float, 
         taker_fee: float, 
-        use_slippage: bool, 
         forecast_periods: int, 
         forecast_length: int
     ) -> None:
@@ -56,8 +57,6 @@ class PortfolioOptimizer():
             Minimum yearly return
         taker_fee: float
             Taker fee.
-        use_slippage: bool
-            False to not take into account slippage in the optimizer.
         forecast_periods: int
             Total number of forecasted periods
         forecast_length: int
@@ -71,9 +70,11 @@ class PortfolioOptimizer():
         self.min_portfolio_change = min_portfolio_change # Minimum change in portfolio before we update it (reduces turnover significantly)
         self.min_yearly_return = min_yearly_return # Minimum yearly return
         self.taker_fee = taker_fee # Taker fee
-        self.use_slippage = use_slippage # True if you want to incorporate slippage in the backtester
         self.forecast_periods = forecast_periods # Total number of forecasted periods
         self.forecast_length = forecast_length # Total ahead forecast in hours
+
+        # Minimum yearly return to trading period length transformation
+        self.min_period_return = self.min_yearly_return * self.forecast_length / HOURS_PER_YEAR
 
         self.build_optimizer(self.asset_universe)
 
@@ -87,9 +88,6 @@ class PortfolioOptimizer():
         cur_tickers: np.ndarray
             Currently traded tickers
         """
-
-        # Minimum yearly return to trading period length transformation
-        self.min_period_return = (1 + self.min_yearly_return)
 
         # Decision Variables
         self.weight = cvx.Variable(len(cur_tickers), name="weight") # Weight that gets optimized
@@ -108,17 +106,10 @@ class PortfolioOptimizer():
         # Parameters used for DPP compliance
         self.risk_aversion = cvx.Parameter(nonneg=True, name="risk_aversion")
         self.covariance_chol = cvx.Parameter((len(cur_tickers), len(cur_tickers)), name="covariance_chol")
-        self.portfolio_holdings_term = cvx.Parameter(len(cur_tickers), name="portfolio_holdings_term")
         self.inverse_size_param = cvx.Parameter(nonneg=True, value=1/self.size.value, name="inverse_size_param")
         self.turnover_limit = cvx.Parameter(len(cur_tickers), nonneg=True, name="turnover_limit")
-
-        # Variables and Parameters used in use_slippage mode
-        if self.use_slippage:
-            # Parameters corresponding to metrics and measurements
-            self.index_prices = cvx.Parameter(len(cur_tickers), nonneg=True, name="index_prices")
-
-            # Parameters used for DPP compliance
-            self.pct_spreads = cvx.Parameter(len(cur_tickers), nonneg=True, name="pct_spreads") 
+        self.pct_spreads = cvx.Parameter(len(cur_tickers), nonneg=True, name="pct_spreads") 
+        
         
         ### Total Return, Taker Fees and Funding Fees ###
         
@@ -136,27 +127,22 @@ class PortfolioOptimizer():
             [cvx.sum(cvx.maximum(0, cvx.multiply(self.weight, self.predicted_funding_rates[j]))) for j in range(self.forecast_periods)]
         )
 
-        # Total slippage (Computed inside optimizer for now!)
-        total_slippage = 0
-        if self.use_slippage:
-            diff = self.weight - self.current_portfolio
+        # Total slippage from bid ask spread
+        diff = self.weight - self.current_portfolio
 
-            base_slippage = self.pct_spreads @ abs_diff
+        base_slippage = self.pct_spreads @ abs_diff
 
-            total_slippage = base_slippage
+        total_slippage = base_slippage
 
         # Total Return after costs
         return_after_costs = return_before_costs - total_taker_fees - total_funding_fees - total_slippage
-
-        # Total Turnover
-        total_turnover = cvx.norm1(self.weight - self.current_portfolio)
 
         # Total Variance
         z = self.covariance_chol @ self.weight
         total_variance = cvx.sum_squares(z)
 
         # Optimization Problem Objective
-        obj = cvx.Maximize(return_after_costs - self.risk_aversion * total_variance_variable) 
+        obj = cvx.Maximize(return_after_costs - self.risk_aversion * total_variance_variable)
 
         # User Settings Optimization Problem Constraints
         constr = []
@@ -169,9 +155,8 @@ class PortfolioOptimizer():
 
         # Optimization constraints for auxiliary variables
         constr += [total_variance_variable >= total_variance]
-        if self.use_slippage:
-            constr += [abs_diff >= diff]
-            constr += [abs_diff >= -diff]
+        constr += [abs_diff >= diff]
+        constr += [abs_diff >= -diff]
 
         self.problem = cvx.Problem(obj, constr)
 
@@ -224,6 +209,9 @@ class PortfolioOptimizer():
         if taker_fee is not None:
             self.taker_fee = taker_fee
 
+        # Minimum yearly return to trading period length transformation
+        self.min_period_return = self.min_yearly_return * self.forecast_length / HOURS_PER_YEAR
+
         self.build_optimizer(cur_tickers)
     
     def optimize(
@@ -231,7 +219,7 @@ class PortfolioOptimizer():
         predicted_returns: np.ndarray,
         predicted_funding_rates: np.ndarray, 
         current_portfolio: np.ndarray, 
-        index_prices: np.ndarray, 
+        mid_prices: np.ndarray, 
         volumes: np.ndarray, 
         cur_size: float,
         cur_tickers: np.ndarray, 
@@ -251,8 +239,8 @@ class PortfolioOptimizer():
             Predicted funding_rates
         current_portfolio:  np.ndarray
             Current portfolio holdings
-        index_prices: np.ndarray
-            Index Prices
+        mid_prices: np.ndarray
+            Mid Prices
         volumes: np.ndarray
             Volumes 
         cur_tickers: np.ndarray
@@ -285,15 +273,8 @@ class PortfolioOptimizer():
         self.risk_aversion.value = self.lambda_0 + self.alpha * cur_error
         self.turnover_limit.value = (self.volume_max_turnover * volumes) / cur_size
         self.inverse_size_param.value = 1/cur_size
-        self.portfolio_holdings_term.value = current_portfolio * index_prices
-
-        # Update Variables and Parameters used in use_slippage mode
-        if self.use_slippage:
-            # Update Parameters corresponding to metrics and measurements
-            self.index_prices.value = index_prices
-
-            # Update Parameters used for DPP compliance
-            self.pct_spreads.value = ((index_prices + 0.5 * spreads) / index_prices - 1)
+        self.pct_spreads.value = ((mid_prices + 0.5 * spreads) / mid_prices - 1)
+            
 
         # Run Optimizer
         try:
@@ -316,21 +297,19 @@ class PortfolioOptimizer():
             solution_dict.loc[coin] = solution[idx]
         return solution_dict.fillna(0), self.problem.status
 
-    def backtest(
+    def generate_target_positions(
         self, 
         initial_size: float,
         predicted_returns: pd.DataFrame, 
         betas: pd.DataFrame, 
-        index_prices: pd.DataFrame, 
         volumes: pd.DataFrame, 
         funding_rates: pd.DataFrame,
         resid_returns: pd.DataFrame, 
         factor_returns: pd.DataFrame, 
         factor_exposures: pd.DataFrame,  
         model_error: pd.Series,
-        plot_results: bool,
         liquidity: pd.DataFrame | None = None
-    ) -> tuple[float, float, float]:
+    ) -> pd.DataFrame:
         """
         Runs a backtest using the portfolio optimizer
 
@@ -345,32 +324,27 @@ class PortfolioOptimizer():
             Betas against BTC
 
             - Index: pd.DatetimeIndex
-            - Columns: ['TICKERS': str, 'beta_clip' float] 
-        index_prices: pd.DataFrame
-            Index Prices
-
-            - Index: pd.DatetimeIndex
-            - Columns: ['TICKERS': str, 'index_price' float] 
+            - Columns: ['TICKERS': str, 'beta_clip': float] 
         volumes: pd.DataFrame
             USD Volumes
 
             - Index: pd.DatetimeIndex
-            - Columns: ['TICKERS': str, 'volume' float] 
+            - Columns: ['TICKERS': str, 'volume': float] 
         funding_rates: pd.DataFrame
             Funding Rates
 
             - Index: pd.DatetimeIndex
-            - Columns: ['TICKERS': str, 'funding_rate' float] 
+            - Columns: ['TICKERS': str, 'funding_rate': float] 
         resid_returns: pd.DataFrame
             Residual returns after taking out the effect of factors
 
             - Index: pd.DatetimeIndex
-            - Columns: ['TICKERS': str, 'index_price' float] 
+            - Columns: ['TICKERS': str, 'index_price': float] 
         factor_returns: pd.DataFrame
             Factor returns
 
             - Index: pd.DatetimeIndex
-            - Columns: ['TICKERS': str, 'SRFresret_0_1' float]
+            - Columns: ['TICKERS': str] + Column for each factor: float 
         factor_exposures: pd.DataFrame
             Factor exposures
 
@@ -380,30 +354,49 @@ class PortfolioOptimizer():
             Model error of the predicted returns
 
             - Index: pd.DatetimeIndex
-            - Columns: float
-        plot_results: boolean
-            If to plot backtest results or not
+            - Columns: [']
         liquidity: pd.DataFrame, optional
             Liquidity data containing spreads
 
             - Index: pd.DatetimeIndex
-            - Columns: ['TICKERS': str, 'spread' float]
+            - Columns: ['TICKERS': str, 'spread': float, 'ask_price': float, 'bid_price': float]
 
         Returns
         -------
-        float
-            Sharpe Ratio.
-        float
-            Calmar Ratio.
-        float
-            Final Equity.
+        pd.DataFrame
+            Dataframe of Target Positios
+
+            - Index: pd.DatetimeIndex
+            - Columns: ['TICKERS': str, 'target': float]
         """
-        # Columns corresponding to factor exposures
+        # Columns corresponding to data
+        predicted_returns_columns = [column_name for column_name in predicted_returns if column_name != "TICKER"]
         exposure_columns = [column_name for column_name in factor_exposures.columns if "exposure" in column_name]
+        factor_returns_columns = [column_name for column_name in factor_returns.columns if "returns" in column_name]
+
+        # Combine all data into one dataframe
+        ticker_dfs_prepped = [predicted_returns.copy(), betas.copy(), volumes.copy(), funding_rates.copy(), resid_returns.copy(), factor_exposures.copy(), liquidity.copy()]
+        for df in ticker_dfs_prepped:
+            df.index.name = "index"
+            df = df.reset_index()
+
+        non_ticker_dfs_prepped = [factor_returns.copy(), model_error.copy()]
+        for df in non_ticker_dfs_prepped:
+            df.index.name = "index"
+            df = df.reset_index()
+
+        full_ticker_df = reduce(lambda left, right: pd.merge(left, right, on=["index", "TICKER"], how="inner"), ticker_dfs_prepped).sort_index()
+        full_non_ticker_df = reduce(lambda left, right: pd.merge(left, right, on=["index"], how="inner"), non_ticker_dfs_prepped).sort_index()
+
+        full_ticker_df["mid_price"] = 0.5 * (full_ticker_df["ask_price"].ffill() + full_ticker_df["bid_price"].ffill())
+
+        resid_returns = full_ticker_df[["SRFresret_0_1", "TICKER"]]
+        resid_returns = resid_returns.pivot_table(index=resid_returns.index, columns='TICKER', values='SRFresret_0_1').fillna(0)
 
         indexes = predicted_returns.index.unique()
         
         cur_holdings = pd.Series(0.0, index=self.asset_universe)
+        cur_holdings_qty = pd.Series(0.0, index=self.asset_universe)
 
         # Tracking pnl
         equity = [initial_size]
@@ -423,49 +416,37 @@ class PortfolioOptimizer():
         # Used to track changes in the asset universe
         last_tickers = []
 
-        # variance penalties tracker for plotting
-        lambdas = []
+        results = []
 
-        min_yearly_return_cached = self.min_yearly_return
-
-        for i in range(len(indexes)-1):
+        for i in range(24*30, len(indexes)-1):
             old_holdings = cur_holdings.copy()
+            old_holdings_qty = cur_holdings_qty.copy()
+
             cur_index = indexes[i]
             next_index = indexes[i+1]
 
-            cur_tickers = predicted_returns.loc[cur_index].TICKER.unique()
+            cur_tickers = full_ticker_df.loc[cur_index].TICKER.unique()
+
+            cur_ticker_data = full_ticker_df.loc[cur_index].reset_index().set_index("TICKER").sort_index()
+            next_ticker_data = full_ticker_df.loc[next_index].reset_index().set_index("TICKER").sort_index()
+            cur_non_ticker_data = full_non_ticker_df.loc[cur_index]
 
             # Convert Prediction Data into Optimizer Format
-            cur_predicted_returns = predicted_returns.loc[cur_index].set_index("TICKER").sort_index()
-            pivoted = cur_predicted_returns[predicted_returns.columns[1:]] 
-            pivoted = pivoted.reindex(index=cur_tickers, fill_value=0)
-            prediction_data = pivoted.T
+            prediction_data = cur_ticker_data[predicted_returns_columns].T
 
             # Current and next index prices
-            cur_index_prices_full = index_prices.loc[cur_index].set_index("TICKER").sort_index()["index_price"]
-            cur_index_prices = index_prices.loc[cur_index][
-                index_prices.loc[cur_index].TICKER.isin(cur_tickers)
-            ].set_index("TICKER").sort_index()["index_price"]
-
-            next_index_prices_full = index_prices.loc[next_index].set_index("TICKER").sort_index()["index_price"]
-            next_index_prices = index_prices.loc[next_index][
-                index_prices.loc[next_index].TICKER.isin(cur_tickers)
-            ].set_index("TICKER").sort_index()["index_price"]
+            cur_mid_prices = cur_ticker_data["mid_price"]
+            next_mid_prices = next_ticker_data["mid_price"]
 
             # Current Volume data
-            cur_volumes = volumes.loc[cur_index][volumes.loc[cur_index].TICKER.isin(cur_tickers)].set_index("TICKER").sort_index()["volume"]
+            cur_volumes = cur_ticker_data["volume"]
 
             # Calculate Covariance based on Factor Model
-            cur_factor_exposures_temp = factor_exposures.loc[cur_index][factor_exposures.loc[cur_index].TICKER.isin(cur_tickers)].set_index("TICKER").sort_index()
-            cur_tickers = cur_factor_exposures_temp.index.unique()
+            cur_factor_exposures_temp = cur_ticker_data[exposure_columns]
 
-            cur_factor_cov = np.array(factor_returns.loc[cur_index-pd.Timedelta(days=30):cur_index].cov())
+            cur_factor_cov = np.array(full_non_ticker_df[factor_returns_columns].loc[cur_index-pd.Timedelta(days=30):cur_index].cov())
 
-            cur_resid_returns = resid_returns.loc[cur_index-pd.Timedelta(days=30):cur_index]
-            cur_resid_returns = cur_resid_returns[cur_resid_returns.TICKER.isin(cur_tickers)].set_index("TICKER")
-            cur_tickers = cur_resid_returns.index.unique()
-            cur_resid_returns = cur_resid_returns.pivot_table(
-                index=cur_resid_returns.index, columns='TICKER', values='SRFresret_0_1').fillna(0)
+            cur_resid_returns = resid_returns.loc[cur_index-pd.Timedelta(days=30):cur_index][cur_tickers]
             
             cur_resid_var = np.diag(cur_resid_returns.var(axis=0))
             cur_factor_exposures_temp = cur_factor_exposures_temp.loc[cur_tickers]
@@ -473,200 +454,61 @@ class PortfolioOptimizer():
 
             cov = pd.DataFrame(cur_factor_exposures @ cur_factor_cov @ cur_factor_exposures.T + cur_resid_var, index=cur_tickers, columns=cur_tickers)
 
+
             # Current betas to btc
-            cur_betas = betas.loc[cur_index][betas.loc[cur_index].TICKER.isin(cur_tickers)].set_index("TICKER").sort_index()["beta_clip"]
+            cur_betas = cur_ticker_data["beta_clip"]
 
             # Current Liquidity Data
-            if self.use_slippage:
-                cur_liquidity_full = liquidity.loc[cur_index].set_index("TICKER").sort_index()
-                cur_liquidity = liquidity.loc[cur_index][liquidity.loc[cur_index].TICKER.isin(cur_tickers)].set_index("TICKER").sort_index()
-
-            # Eliminate all tickers with missing data anywhere
-            set_prediction_data_tickers = set(prediction_data.columns)
-            set_index_prices_tickers = set(cur_index_prices.index.unique())
-            set_cur_volume_tickers = set(cur_volumes.index.unique())
-            set_cov_tickers = set(cov.index.unique())
-            set_betas_tickers = set(cur_betas.index.unique())
-
-            if self.use_slippage:
-                set_cur_liquidity_tickers = set(cur_liquidity.index.unique())
-
-                cur_tickers = np.array(list(set_prediction_data_tickers
-                                & set_index_prices_tickers
-                                & set_cur_volume_tickers
-                                & set_cov_tickers
-                                & set_betas_tickers
-                                & set_cur_liquidity_tickers))
-            else:
-                cur_tickers = np.array(list(set_prediction_data_tickers
-                                & set_index_prices_tickers
-                                & set_cur_volume_tickers
-                                & set_cov_tickers
-                                & set_betas_tickers))
-
-            prediction_data = prediction_data[cur_tickers]
-            cur_index_prices = cur_index_prices.loc[cur_tickers]
-            next_index_prices = next_index_prices.reindex(cur_tickers)
-            cur_volumes = cur_volumes.loc[cur_tickers]
-            cov = cov.loc[cur_tickers , cur_tickers]
-            cur_betas = cur_betas.loc[cur_tickers]
-            if self.use_slippage:
-                cur_liquidity = cur_liquidity.loc[cur_tickers]
+            cur_liquidity = cur_ticker_data["spread"]
 
     
             # Rebuild Optimizer if dimensions change
             if len(last_tickers) != len(cur_tickers):
                 self.build_optimizer(cur_tickers)
 
-
             try:
-                cur_error = model_error[cur_index]
+                cur_error = cur_non_ticker_data["error"]
             except:
                 cur_error = 0
-
-            lambdas.append(self.lambda_0 + self.alpha * cur_error)
             
 
             # Run optimizer
-            if self.use_slippage:
-                portfolio_holdings, status = self.optimize(
-                    prediction_data.values,
-                    np.zeros((len(prediction_data), len(cur_tickers))),
-                    (cur_holdings[cur_tickers] * cur_index_prices).values/equity[-1],
-                    cur_index_prices.values,
-                    cur_volumes.values,
-                    equity[-1],
-                    cur_tickers,
-                    cur_betas.values,
-                    cur_error,
-                    cov.values,
-                    spreads=cur_liquidity["spread"].values
-                ) 
-            else:
-                portfolio_holdings, status = self.optimize(
-                    prediction_data.values,
-                    np.zeros((len(prediction_data), len(cur_tickers))),
-                    (cur_holdings[cur_tickers] * cur_index_prices).values/equity[-1],
-                    cur_index_prices.values,
-                    cur_volumes.values,
-                    equity[-1],
-                    cur_tickers,
-                    cur_betas.values,
-                    cur_error,
-                    cov.values
-                )
-            statuses.append(status)
-            portfolio_holdings = ((portfolio_holdings * equity[-1]) / cur_index_prices_full).fillna(0)
+            portfolio_holdings, status = self.optimize(
+                prediction_data.values,
+                np.zeros((len(prediction_data), len(cur_tickers))),
+                cur_holdings[cur_tickers].values,
+                cur_mid_prices.values,
+                cur_volumes.values,
+                initial_size,
+                cur_tickers,
+                cur_betas.values,
+                cur_error,
+                cov.values,
+                cur_liquidity.values
+            ) 
+
+            portfolio_holdings_usd = initial_size * portfolio_holdings
+            portfolio_holdings_qty = (portfolio_holdings_usd / cur_mid_prices).fillna(0.0)
 
             # Change in Portfolio Holdings
             holdings_change = (portfolio_holdings - old_holdings).fillna(0)
-            holdings_change_pct = (holdings_change * cur_index_prices_full).fillna(0)/equity[-1]
-            if sum(abs(holdings_change_pct)) >= self.min_portfolio_change:
-                cur_holdings = portfolio_holdings
+            holdings_change_qty = (portfolio_holdings_qty - old_holdings_qty).fillna(0)
 
-            holdings_change = (cur_holdings - old_holdings).fillna(0)
-            holdings_change_pct = (holdings_change * cur_index_prices_full).fillna(0)/equity[-1]
+            if sum(abs(holdings_change)) >= self.min_portfolio_change:
+                new_holdings = portfolio_holdings
+                new_holdings_qty = portfolio_holdings_qty
 
-            # Price change
-            index_price_changes = (next_index_prices_full - cur_index_prices_full).fillna(0)
-            cur_return = sum((cur_holdings * index_price_changes).fillna(0))
+            cur_holdings = (new_holdings_qty * cur_mid_prices).fillna(0) / initial_size
 
-            # Current funding rates
-            cur_funding_rates = funding_rates.loc[cur_index].set_index("TICKER")["funding_rate"]
-            
-            # Total trading costs
-            cur_funding_fee = -sum((cur_funding_rates * cur_holdings*cur_index_prices_full).fillna(0))
-            cur_taker_fee = np.linalg.norm((holdings_change*cur_index_prices_full).fillna(0), ord=1) * self.taker_fee
-            cur_slippage_fee = 0
-            if self.use_slippage:
-                pct_spreads = ((cur_index_prices_full + 0.5 * cur_liquidity_full["spread"]) / cur_index_prices_full - 1).fillna(0)
-                cur_slippage_fees = (pct_spreads * abs(holdings_change) * cur_index_prices_full).fillna(0)
-                cur_slippage_fee = sum(cur_slippage_fees)
-            
-            return_after_costs = cur_return - cur_taker_fee + cur_funding_fee - cur_slippage_fee
+            temp_df = cur_holdings.reset_index()
+            temp_df.columns = ["TICKER", "target"]
+            temp_df["timestamp"] = cur_index
 
-            equity.append(equity[-1] + return_after_costs)
-            equity_no_fees.append(equity_no_fees[-1] + cur_return)
-            costs_incurred.append(costs_incurred[-1] - cur_taker_fee - cur_slippage_fee)
-            funding_pnl.append(funding_pnl[-1] + cur_funding_fee)
-
-            # Aggregated Statistics
-            cur_aggregated_data = pd.DataFrame({"Gross Notional": abs(cur_holdings.loc[cur_tickers]) @ cur_index_prices, "EOT Notional": cur_holdings.loc[cur_tickers] @ cur_index_prices, 
-                                    "Holding PnL": cur_return, "Taker Fees": -cur_taker_fee, "Slippage Fees": -cur_slippage_fee, "Funding PnL": cur_funding_fee,
-                                    "Net Turnover": sum(holdings_change_pct), "Gross Turnover": sum(abs(holdings_change_pct)), "Net PnL": return_after_costs}, 
-                                    index=[cur_index])
-            statistics_df = pd.concat([statistics_df, cur_aggregated_data])
-
-            # Individual Coin Statistics
-            holdings_values = cur_holdings.loc[cur_tickers].values  # All holdings at once (vectorized access)
-            prices_values = cur_index_prices.loc[cur_tickers].values  # Precompute index prices
-            index_price_changes_values = index_price_changes.loc[cur_tickers].values  # Precompute index price changes
-            slippage_fees_values = np.array([cur_slippage_fees.get(coin, 0) for coin in cur_tickers])  # Handle slippage fees
-            funding_rates_values = np.array([cur_funding_rates[coin] for coin in cur_tickers])  # Funding rates
-
-            # Preallocate arrays for results
-            cur_ticker_gross_notionals = np.abs(holdings_values) * prices_values
-            cur_ticker_eot_notionals = holdings_values * prices_values
-            cur_ticker_holding_pnls = holdings_values * index_price_changes_values
-            cur_ticker_taker_fees = -np.abs(holdings_change.loc[cur_tickers]) * self.taker_fee
-            cur_ticker_slippage_fees = -slippage_fees_values if self.use_slippage else np.zeros_like(slippage_fees_values)
-            cur_ticker_funding_pnls = -funding_rates_values * holdings_values
-            cur_ticker_net_turnovers = holdings_change_pct.loc[cur_tickers].values
-            cur_ticker_gross_turnovers = np.abs(holdings_change_pct.loc[cur_tickers].values)
-
-            # Compute net PnLs
-            cur_ticker_net_pnls = cur_ticker_holding_pnls + cur_ticker_taker_fees + cur_ticker_funding_pnls + cur_ticker_slippage_fees
-
-            new_data = pd.DataFrame({"Gross Notional": cur_ticker_gross_notionals, "EOT Notional": cur_ticker_eot_notionals, "Holding PnL": cur_ticker_holding_pnls,
-                                    "Taker Fees": cur_ticker_taker_fees, "Slippage Fees": cur_ticker_slippage_fees, "Funding PnL": cur_ticker_funding_pnls,
-                                    "Net Turnover": cur_ticker_net_turnovers, "Gross Turnover": cur_ticker_gross_turnovers, "Net PnL": cur_ticker_net_pnls, "TICKER": cur_tickers}, 
-                                    index=[cur_index]*len(cur_tickers))
-
-            coin_data = pd.concat([coin_data, new_data])
+            results.append(temp_df)
 
             last_index = cur_index
             last_tickers = cur_tickers
 
-        print(cur_index)
-        rets_bps = 10000.0 * pd.Series(equity[::24], index=indexes[::24]).pct_change()
-        stats, daily_rets_bps, return_index, drawdown_bps, rolling_1yr_vol_bps = compounded_daily_return_stats(rets_bps)
-        if plot_results:
-            cur_index_array = list(indexes[:-1])
-            figs, ax = plt.subplots(2, figsize=(12, 8), sharex=True)
+        final_df = pd.concat(results, ignore_index=True)
 
-            # Plot PnL and PnL components
-            ax[0].plot([indexes[0] - pd.Timedelta(hours=1)] + cur_index_array, (np.array(equity) - equity[0])/equity[0], label="Net PnL")
-            ax[0].plot([indexes[0] - pd.Timedelta(hours=1)] + cur_index_array, (np.array(equity_no_fees) - equity[0])/equity[0], label="Holding PnL")
-            ax[0].plot([indexes[0] - pd.Timedelta(hours=1)] + cur_index_array, np.array(costs_incurred)/equity[0], label="Total Cost")
-            ax[0].plot([indexes[0] - pd.Timedelta(hours=1)] + cur_index_array, np.array(funding_pnl)/equity[0], label="Funding PnL")
-
-            # Formatting
-            ax[0].yaxis.set_major_formatter(ScalarFormatter(useMathText=False))
-            ax[0].yaxis.get_major_formatter().set_scientific(False)
-            ax[0].yaxis.get_major_formatter().set_useOffset(False)
-            ax[0].legend()
-            ax[0].set_title("PnL Breakdown")
-
-            # Rotate x-ticks
-            plt.setp(ax[0].xaxis.get_majorticklabels(), rotation=20)
-
-            # Plot lambdas
-            ax[1].plot(cur_index_array, lambdas, label="Risk Aversion", color='orange')
-            ax[1].legend()
-            ax[1].set_title("Risk Aversion Over Time")
-            plt.setp(ax[1].xaxis.get_majorticklabels(), rotation=20)
-
-            # Final layout
-            plt.tight_layout()
-            plt.show()
-
-            print(pd.Series(stats))
-        print("Backtest Complete!")
-
-        status_df = pd.Series(statuses, index=indexes[:-1])
-        status_df.to_csv("SolutionStatus.csv")
-
-        statistics_df.to_csv("Statistics_Aggregated.csv")
-        coin_data.to_csv("Statistics.csv")
-
-        return pd.Series(stats)["sharpe                    "], pd.Series(stats)['annual_ret/max_drawdown   '], equity[-1]
+        return final_df
