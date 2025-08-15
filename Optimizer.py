@@ -364,7 +364,7 @@ class PortfolioOptimizer():
         Returns
         -------
         pd.DataFrame
-            Dataframe of Target Positios
+            Dataframe of Target Positions
 
             - Index: pd.DatetimeIndex
             - Columns: ['TICKERS': str, 'target': float]
